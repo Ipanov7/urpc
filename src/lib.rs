@@ -3,6 +3,7 @@ use std::{
     net::{SocketAddr, UdpSocket},
     sync::{Arc, Mutex},
     thread, usize,
+    collections::HashMap,
 };
 
 pub trait UrpcService {
@@ -12,18 +13,21 @@ pub trait UrpcService {
 struct DefaultUrpcService {}
 
 impl UrpcService for DefaultUrpcService {
-    fn dispatch(&mut self, _method_name: String, _args: String) {
-        panic!("missing service definition")
+    fn dispatch(&mut self, method_name: String, _args: String) {
+        panic!("method {} not implemented", method_name)
     }
 }
 
+type UrpcServiceSync = Arc<Mutex<dyn UrpcService + Send + 'static>>;
+
 pub struct UrpcServer {
     socket: UdpSocket,
-    service: Arc<Mutex<dyn UrpcService + Send + 'static>>,
+    services: HashMap<String, UrpcServiceSync>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct UrpcRequest {
+    pub service: String,
     pub method: String,
     pub message: String,
 }
@@ -31,12 +35,14 @@ pub struct UrpcRequest {
 impl UrpcServer {
     pub fn new(address: &str) -> UrpcServer {
         let socket = UdpSocket::bind(address).expect("couldn't bind to address");
-        let service = Arc::new(Mutex::new(DefaultUrpcService{}));
-        UrpcServer { socket, service }
+        UrpcServer { socket, services: HashMap::new() }
     }
 
-    pub fn register(&mut self, service: impl UrpcService + Send + 'static) {
-        self.service = Arc::new(Mutex::new(service));
+    pub fn register(&mut self, service_name: String, service: impl UrpcService + Send + 'static) {
+        if self.services.contains_key(&service_name) {
+            panic!("service {} already defined!", service_name)
+        }
+        self.services.insert(service_name, Arc::new(Mutex::new(service)));
     }
 
     pub fn start(server: UrpcServer) {
@@ -60,12 +66,17 @@ impl UrpcServer {
         let request: UrpcRequest =
             serde_json::from_slice(&buf[..size]).unwrap_or_else(|err| panic!("{err}"));
 
+        let service_name = request.service;
         let method_name = request.method;
         let args = request.message.clone();
 
         println!("Received request: {} with message: {}", method_name, args);
 
-        self.service.lock().unwrap().dispatch(method_name, args);
+        if !self.services.contains_key(&service_name) {
+           panic!("missing service definition for {}", service_name); 
+        }
+
+        self.services.get(&service_name).unwrap().lock().unwrap().dispatch(method_name, args);
 
         Ok(())
     }
@@ -77,11 +88,12 @@ pub fn decode<D: de::DeserializeOwned>(message: String) -> D {
 
 pub struct UrpcClient {
     socket: UdpSocket,
+    service: String,
     recipients: Vec<SocketAddr>,
 }
 
 impl UrpcClient {
-    pub fn new(recipients_addr: Vec<&String>) -> UrpcClient {
+    pub fn new(service: String, recipients_addr: Vec<&String>) -> UrpcClient {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("couldn't bind to client address");
 
         let mut recipients = Vec::new();
@@ -90,11 +102,12 @@ impl UrpcClient {
             recipients.push(recipient);
         }
 
-        UrpcClient { socket, recipients }
+        UrpcClient { socket, service, recipients }
     }
 
     pub fn send<T: Serialize>(&self, method: &str, message: T) {
         let request = UrpcRequest {
+            service: self.service.clone(),
             method: method.into(),
             message: encode(message),
         };
